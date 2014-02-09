@@ -4,9 +4,6 @@ import (
 	"net"
 )
 
-type TunnelConfig struct {
-}
-
 const (
 	SocksAddrTypeIPv4 = iota
 	SocksAddrTypeIPv6
