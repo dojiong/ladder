@@ -7,11 +7,14 @@ import (
 )
 
 const SocksVersion = 5
+const SocksUPCheckVersion = 1
 
 var (
 	SocksAuthNotRequired         = []byte{SocksVersion, 0}
 	SocksAuthUserPasswd          = []byte{SocksVersion, 2}
 	SocksAuthMethodNotMatch      = []byte{SocksVersion, 0xFF}
+	SocksUPAuthSuccess           = []byte{SocksUPCheckVersion, 0}
+	SocksUPAuthFail              = []byte{SocksUPCheckVersion, 1}
 	SocksReplySuccess            = []byte{SocksVersion, 0, 0, 1, 0, 0, 0, 0, 0, 0}
 	SocksReplyServerFail         = []byte{SocksVersion, 1, 0, 1, 0, 0, 0, 0, 0, 0}
 	SocksReplyNotAllowed         = []byte{SocksVersion, 2, 0, 1, 0, 0, 0, 0, 0, 0}
@@ -23,30 +26,28 @@ var (
 	SocksReplyInvalidAddrType    = []byte{SocksVersion, 8, 0, 1, 0, 0, 0, 0, 0, 0}
 )
 
-type Socks5Handler struct {
-	client       net.Conn
-	remote       TunnelSock
-	user, passwd string
-	should_auth  bool
+type socks5Handler struct {
+	client net.Conn
+	remote TunnelSock
 }
 
-func NewSocks5Handler(cli net.Conn, user, passwd string) *Socks5Handler {
-	var auth bool = false
-	if len(user) > 0 && len(passwd) > 0 {
-		auth = true
+type Socks5ProxyResult struct {
+	Up   int64
+	Down int64
+}
+
+func HandleSocks5(cli net.Conn, tun Tunnel, auth SocksAuth) *Socks5ProxyResult {
+	defer cli.Close()
+	h := &socks5Handler{cli, nil}
+	if h.authenticate(auth) && h.handleRequest(tun) {
+		rst := h.copyData()
+		log.Printf("%s: %d/%d\n", h.remote.RemoteAddr(), rst.Up, rst.Down)
+		return &rst
 	}
-	return &Socks5Handler{cli, nil, user, passwd, auth}
+	return nil
 }
 
-func (s *Socks5Handler) Start(tun Tunnel) {
-	if s.Authenticate() && s.HandleRequest(tun) {
-		rst := s.CopyData()
-		log.Printf("%s: %d/%d\n", s.remote.RemoteAddr(), rst.Up, rst.Down)
-	}
-	s.client.Close()
-}
-
-func (s *Socks5Handler) Authenticate() bool {
+func (s *socks5Handler) authenticate(auth SocksAuth) bool {
 	/*
 		+----+----------+----------+
 		|VER | NMETHODS | METHODS  |
@@ -55,9 +56,7 @@ func (s *Socks5Handler) Authenticate() bool {
 		+----+----------+----------+
 	*/
 	var buf [257]byte
-	if _, err := io.ReadFull(s.client, buf[:2]); err != nil {
-		return false
-	} else if buf[0] != 5 {
+	if _, err := io.ReadFull(s.client, buf[:2]); err != nil || buf[0] != 5 {
 		return false
 	} else if buf[1] > 0 {
 		if _, err := io.ReadFull(s.client, buf[2:2+buf[1]]); err != nil {
@@ -72,27 +71,71 @@ func (s *Socks5Handler) Authenticate() bool {
 	   | 1  |   1    |
 	   +----+--------+
 	*/
-	if s.should_auth {
-		if buf[1] == 0 {
-			s.client.Write(SocksAuthMethodNotMatch)
-			return false
+	var method byte = 0
+	auth_rep := SocksAuthNotRequired
+	if auth != nil {
+		method = 2
+		auth_rep = SocksAuthUserPasswd
+	}
+
+	support_method := false
+	for i := 2; i < 2+int(buf[1]); i++ {
+		if buf[i] == method {
+			support_method = true
+			if _, err := s.client.Write(auth_rep); err != nil {
+				return false
+			}
+			break
 		}
-		if _, err := s.client.Write(SocksAuthUserPasswd); err != nil {
-			return false
-		}
-		return s.CheckUserPasswd()
-	} else if _, err := s.client.Write(SocksAuthNotRequired); err != nil {
+	}
+	if !support_method {
+		s.client.Write(SocksAuthMethodNotMatch)
 		return false
+	}
+
+	if auth != nil {
+		return s.checkUserPasswd(auth)
 	}
 	return true
 }
 
-func (s *Socks5Handler) CheckUserPasswd() bool {
-	//TODO: protocol
-	return false
+func (s *socks5Handler) checkUserPasswd(auth SocksAuth) bool {
+	/*
+	   +----+------+----------+------+----------+
+	   |VER | ULEN |  UNAME   | PLEN |  PASSWD  |
+	   +----+------+----------+------+----------+
+	   | 1  |  1   | 1 to 255 |  1   | 1 to 255 |
+	   +----+------+----------+------+----------+
+	*/
+	var buf [513]byte
+
+	if _, err := io.ReadFull(s.client, buf[:2]); err != nil {
+		return false
+	} else if buf[0] != 1 || buf[1] == 0 {
+		return false
+	}
+	idx := 2 + buf[1]
+	if _, err := io.ReadFull(s.client, buf[2:idx+1]); err != nil || buf[idx] == 0 {
+		return false
+	}
+	user := string(buf[2:idx])
+	if _, err := io.ReadFull(s.client, buf[idx+1:idx+1+buf[idx]]); err != nil {
+		return false
+	}
+	passwd := string(buf[idx+1 : idx+1+buf[idx]])
+
+	auth_ok := auth.Check(user, passwd)
+	if auth_ok {
+		s.client.Write(SocksUPAuthSuccess)
+	} else {
+		s.client.Write(SocksUPAuthFail)
+	}
+	log.Println("check", user, passwd, auth, auth_ok)
+
+	return auth_ok
 }
 
-func (s *Socks5Handler) HandleRequest(tun Tunnel) bool {
+func (s *socks5Handler) handleRequest(tun Tunnel) bool {
 	/*Request:
 	  +----+-----+-------+------+----------+----------+
 	  |VER | CMD |  RSV  | ATYP | DST.ADDR | DST.PORT |
@@ -162,17 +205,12 @@ type IOCopyStat struct {
 	err       error
 }
 
-type Socks5ProxyResult struct {
-	Up   int64
-	Down int64
-}
-
 func copy_helper(ch chan IOCopyStat, dst io.Writer, src io.Reader, to_remote bool) {
 	n, err := io.Copy(dst, src)
 	ch <- IOCopyStat{to_remote, n, err}
 }
 
-func (s *Socks5Handler) CopyData() (rst Socks5ProxyResult) {
+func (s *socks5Handler) copyData() (rst Socks5ProxyResult) {
 	ch := make(chan IOCopyStat, 2)
 	go copy_helper(ch, s.remote, s.client, true)
 	go copy_helper(ch, s.client, s.remote, false)

@@ -52,11 +52,12 @@ func main() {
 	}
 
 	p := &Tunnel{}
+	auth := ladder.NewSimpleAuth()
+	auth["lo"] = "1234"
 
 	li, _ := net.Listen("tcp", "127.0.0.1:8989")
 	for {
 		cli, _ := li.Accept()
-		h := ladder.NewSocks5Handler(cli, "", "")
-		go h.Start(p)
+		go ladder.HandleSocks5(cli, p, auth)
 	}
 }
