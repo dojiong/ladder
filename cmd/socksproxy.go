@@ -1,15 +1,18 @@
 package main
 
 import (
+	"flag"
 	"github.com/lodevil/ladder"
 	"log"
 	"net"
+	"os"
+	"runtime/pprof"
 	"strconv"
 )
 
-type Pipe struct{}
+type Tunnel struct{}
 
-func (p *Pipe) New(addr_type int, addr []byte, port uint16) ladder.SockLine {
+func (t *Tunnel) NewSock(addr_type int, addr []byte, port uint16) ladder.TunnelSock {
 	var host string
 	switch addr_type {
 	case ladder.SocksAddrTypeIPv6:
@@ -21,16 +24,34 @@ func (p *Pipe) New(addr_type int, addr []byte, port uint16) ladder.SockLine {
 	}
 	host = net.JoinHostPort(host, strconv.Itoa(int(port)))
 	if conn, err := net.Dial("tcp", host); err != nil {
-		log.Println("connect fail", host, err)
 		return nil
 	} else {
-		log.Println("got", host)
 		return conn
 	}
 }
 
+func (t *Tunnel) Init(cfg ladder.Config) error {
+	return nil
+}
+
+func (t *Tunnel) Shutdown() error {
+	return nil
+}
+
+var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
+
 func main() {
-	p := &Pipe{}
+	flag.Parse()
+	if *cpuprofile != "" {
+		f, err := os.Create(*cpuprofile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
+	}
+
+	p := &Tunnel{}
 
 	li, _ := net.Listen("tcp", "127.0.0.1:8989")
 	for {
